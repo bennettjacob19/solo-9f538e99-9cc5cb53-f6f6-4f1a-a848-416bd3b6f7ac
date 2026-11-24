@@ -1,0 +1,13 @@
+services:
+  vxlan-drill:
+    build: .
+    image: vxlan-drill
+    ports:
+      - "8000:8000"        # API + Swagger UI (/docs)
+      - "4789:4789/udp"    # receiver A (egress A's tunnel endpoint)
+      - "4790:4790/udp"    # receiver B (egress B's tunnel endpoint)
+    environment:
+      # Per-egress pending-frame limits, set at startup. Full -> enqueue refused.
+      EGRESS_A_CAPACITY: "100"
+      EGRESS_B_CAPACITY: "50"
+      SEND_INTERVAL: "0.001"
