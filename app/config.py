@@ -28,6 +28,11 @@ class Settings:
     egress_b_capacity: int = 100
     # Pacing between frames per egress, in seconds (0 = as fast as possible).
     send_interval: float = 0.0
+    # Backoff between write retries after an EAGAIN, in seconds. With the
+    # default 0.06 a continuously unwritable egress with pending frames
+    # attempts at most ~17 writes per second (< 20), and a released egress
+    # resumes well within 100 ms.
+    write_retry_interval: float = 0.06
     # How many received frames each receiver keeps for inspection.
     received_buffer: int = 5000
 
@@ -41,5 +46,6 @@ class Settings:
             egress_a_capacity=_int("EGRESS_A_CAPACITY", 100),
             egress_b_capacity=_int("EGRESS_B_CAPACITY", 100),
             send_interval=_float("SEND_INTERVAL", 0.0),
+            write_retry_interval=_float("WRITE_RETRY_INTERVAL", 0.06),
             received_buffer=_int("RECEIVED_BUFFER", 5000),
         )

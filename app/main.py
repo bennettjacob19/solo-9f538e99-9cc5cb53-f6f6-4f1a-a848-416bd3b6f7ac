@@ -28,10 +28,19 @@ the old egress must follow it onto the new tunnel.
 * Pause/resume either egress independently; the other keeps sending.
 * Each egress has a startup-configured pending-frame limit; a full egress
   refuses new frames.
+* A frame counts as sent only after its socket write succeeds. Writes that
+  fail with EAGAIN leave the frame queued on its egress (still occupying
+  capacity, still migrating with its destination on a rebind) and are
+  retried with a paced backoff.
+* `POST /api/egresses/{A|B}/block_writes` simulates that egress's socket
+  answering EAGAIN; `unblock_writes` releases it — a backed-up, unpaused
+  egress resumes sending within 100 ms. Egress state exposes per-egress
+  write-attempt counters.
 * Rebinding moves the destination's not-yet-sent frames to the new egress
   atomically (they and later frames are each sent once, in enqueue order).
-  If the new egress cannot hold them all, the rebind is refused and the
-  binding plus both queues stay unchanged.
+  If the new egress cannot hold them all, the rebind is refused (409) and
+  the binding plus both queues stay unchanged; the old egress never leaks
+  moved frames, even after its writes recover.
 """
 
 
@@ -125,6 +134,22 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.post("/api/egresses/{name}/resume", tags=["egress"], summary="Resume one egress")
     async def resume_egress(name: str):
         return forwarder.resume(_egress_name(name))
+
+    @app.post(
+        "/api/egresses/{name}/block_writes",
+        tags=["egress"],
+        summary="Simulate this egress's socket answering every write with EAGAIN",
+    )
+    async def block_writes(name: str):
+        return forwarder.block_writes(_egress_name(name))
+
+    @app.post(
+        "/api/egresses/{name}/unblock_writes",
+        tags=["egress"],
+        summary="Release the simulated EAGAIN (a backed-up egress resumes within 100 ms)",
+    )
+    async def unblock_writes(name: str):
+        return forwarder.unblock_writes(_egress_name(name))
 
     # -- bindings ------------------------------------------------------------
     @app.get("/api/bindings", tags=["bindings"], summary="List (VNI, dst MAC) -> egress bindings")

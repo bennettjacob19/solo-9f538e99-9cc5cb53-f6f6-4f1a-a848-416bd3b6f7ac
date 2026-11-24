@@ -12,6 +12,14 @@ Design notes
   atomic with respect to concurrent injection and sending: every frame of the
   destination is sent exactly once, in enqueue order, no matter how the
   operations interleave.
+* A frame is dequeued only *after* its socket write succeeds: the sender
+  peeks the round-robin head frame, writes it to the UDP socket, and pops it
+  only on success — all under the same lock hold, so a rebind can never
+  straddle a half-sent frame. If the write fails with EAGAIN (real or
+  simulated via the API), the frame stays queued: it keeps occupying the
+  egress's capacity, is counted as *not* sent, migrates with its destination
+  on a rebind, and is retried after a paced backoff. The old egress therefore
+  holds nothing it could leak once the destination has been rebound away.
 * The capacity check happens before anything is moved; if the target egress
   cannot hold all of the destination's pending frames, the rebind is refused
   and the binding plus both queues are left untouched.
@@ -20,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -67,20 +76,30 @@ class Frame:
 class Egress:
     """One tunnel egress: per-destination queues plus a paced UDP sender."""
 
-    def __init__(self, name: str, capacity: int, send_interval: float) -> None:
+    def __init__(
+        self, name: str, capacity: int, send_interval: float, retry_interval: float
+    ) -> None:
         self.name = name
         self.capacity = capacity
         self.send_interval = send_interval
+        self.retry_interval = retry_interval
         self.pending: Dict[Key, Deque[Frame]] = {}
         self.active: Deque[Key] = deque()  # destinations to visit, round-robin
         self.count = 0
         self.paused = False
         self.sent = 0
+        # Write accounting: every socket-write attempt is counted, successful
+        # or not; write_eagain counts the attempts refused with EAGAIN.
+        self.write_attempts = 0
+        self.write_eagain = 0
+        # Fault injection: simulate this egress's socket answering EAGAIN.
+        self.writes_blocked = False
         self.target: Optional[Tuple[str, int]] = None
         # The following are created in start(), inside the running event loop.
         self._lock: Optional[asyncio.Lock] = None
         self._nonempty: Optional[asyncio.Event] = None
         self._resumed: Optional[asyncio.Event] = None
+        self._retry_wake: Optional[asyncio.Event] = None
         self._task: "Optional[asyncio.Task[None]]" = None
         self._transport: Optional[asyncio.DatagramTransport] = None
 
@@ -89,6 +108,7 @@ class Egress:
         self._nonempty = asyncio.Event()
         self._resumed = asyncio.Event()
         self._resumed.set()
+        self._retry_wake = asyncio.Event()
         loop = asyncio.get_running_loop()
         self._transport, _ = await loop.create_datagram_endpoint(
             asyncio.DatagramProtocol, remote_addr=self.target
@@ -118,7 +138,8 @@ class Egress:
         assert self._nonempty is not None
         self._nonempty.set()
 
-    def dequeue_locked(self) -> Optional[Frame]:
+    def peek_locked(self) -> Optional[Frame]:
+        """Return the round-robin head frame without removing it."""
         assert self._nonempty is not None
         while self.active:
             key = self.active[0]
@@ -127,19 +148,30 @@ class Egress:
                 # Stale entry (destination rebound away): drop lazily, O(1).
                 self.active.popleft()
                 continue
-            frame = q.popleft()
-            self.count -= 1
-            if q:
-                self.active.rotate(-1)
-            else:
-                del self.pending[key]
-                self.active.popleft()
-            if self.count == 0:
-                self._nonempty.clear()
-            return frame
+            return q[0]
         if self.count == 0:
             self._nonempty.clear()
         return None
+
+    def pop_head_locked(self) -> Frame:
+        """Remove the frame previously returned by peek_locked().
+
+        Only called after the peeked frame was successfully written to the
+        socket, with no await in between, so the head cannot have changed.
+        """
+        assert self._nonempty is not None
+        key = self.active[0]
+        q = self.pending[key]
+        frame = q.popleft()
+        self.count -= 1
+        if q:
+            self.active.rotate(-1)
+        else:
+            del self.pending[key]
+            self.active.popleft()
+        if self.count == 0:
+            self._nonempty.clear()
+        return frame
 
     # -- pause / resume -----------------------------------------------------
     def pause(self) -> None:
@@ -151,27 +183,69 @@ class Egress:
         self.paused = False
         assert self._resumed is not None
         self._resumed.set()
+        assert self._retry_wake is not None
+        self._retry_wake.set()  # cut short a retry backoff
+
+    # -- fault injection ------------------------------------------------------
+    def block_writes(self) -> None:
+        """Simulate this egress's UDP socket answering every write with EAGAIN."""
+        self.writes_blocked = True
+
+    def unblock_writes(self) -> None:
+        """Release the simulated EAGAIN and wake a backed-up sender at once."""
+        self.writes_blocked = False
+        assert self._retry_wake is not None
+        self._retry_wake.set()
 
     # -- sender ---------------------------------------------------------------
+    def _write(self, packet: bytes) -> None:
+        """One socket-write attempt; raises BlockingIOError on EAGAIN."""
+        if self.writes_blocked:
+            raise BlockingIOError(errno.EAGAIN, "simulated EAGAIN (writes blocked via API)")
+        assert self._transport is not None
+        self._transport.sendto(packet)
+
+    async def _try_send_head(self) -> bool:
+        """Attempt to send the head frame once. Return True if it hit EAGAIN."""
+        assert self._lock is not None
+        async with self._lock:
+            if self.paused:
+                return False
+            frame = self.peek_locked()
+            if frame is None:
+                return False
+            packet = build_vxlan_packet(frame.vni, frame.inner)
+            self.write_attempts += 1
+            try:
+                self._write(packet)
+            except BlockingIOError:
+                # Not sent: the frame stays queued, keeps occupying this
+                # egress's capacity, and still migrates with its destination
+                # on a rebind. The lock is held across peek/write, so no
+                # rebind can straddle this attempt.
+                self.write_eagain += 1
+                return True
+            # The socket accepted the frame: only now dequeue and count it.
+            self.pop_head_locked()
+            self.sent += 1
+            return False
+
     async def _sender_loop(self) -> None:
-        assert self._lock is not None and self._resumed is not None
-        assert self._nonempty is not None and self._transport is not None
+        assert self._resumed is not None and self._nonempty is not None
+        assert self._retry_wake is not None
         while True:
             await self._resumed.wait()
             await self._nonempty.wait()
-            async with self._lock:
-                if self.paused:
-                    continue
-                frame = self.dequeue_locked()
-            if frame is None:
-                continue
-            packet = build_vxlan_packet(frame.vni, frame.inner)
-            # sendto() is synchronous: no other coroutine can run between the
-            # dequeue above and this send, so a rebind never straddles a
-            # half-sent frame.
-            self._transport.sendto(packet)
-            self.sent += 1
-            if self.send_interval:
+            eagain = await self._try_send_head()
+            if eagain:
+                # Paced retry: with the default 0.06 s interval a
+                # continuously unwritable egress attempts < 20 writes/s, and
+                # a released egress (event set by unblock/resume) retries
+                # immediately — well within 100 ms.
+                self._retry_wake.clear()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._retry_wake.wait(), self.retry_interval)
+            elif self.send_interval:
                 await asyncio.sleep(self.send_interval)
 
     # -- introspection --------------------------------------------------------
@@ -182,6 +256,9 @@ class Egress:
             "pending": self.count,
             "paused": self.paused,
             "sent": self.sent,
+            "writes_blocked": self.writes_blocked,
+            "write_attempts": self.write_attempts,
+            "write_eagain": self.write_eagain,
             "target": f"{self.target[0]}:{self.target[1]}" if self.target else None,
             "destinations": [
                 {"vni": key[0], "dst_mac": key[1], "pending": len(q)}
@@ -271,8 +348,12 @@ class Forwarder:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.egresses: Dict[str, Egress] = {
-            "A": Egress("A", settings.egress_a_capacity, settings.send_interval),
-            "B": Egress("B", settings.egress_b_capacity, settings.send_interval),
+            "A": Egress(
+                "A", settings.egress_a_capacity, settings.send_interval, settings.write_retry_interval
+            ),
+            "B": Egress(
+                "B", settings.egress_b_capacity, settings.send_interval, settings.write_retry_interval
+            ),
         }
         self.receivers: Dict[str, Receiver] = {
             "A": Receiver("A", settings.receiver_host, settings.receiver_a_port, settings.received_buffer),
@@ -423,6 +504,15 @@ class Forwarder:
 
     def resume(self, name: str) -> dict:
         self.egresses[name].resume()
+        return self.egresses[name].snapshot()
+
+    # -- fault injection -----------------------------------------------------------
+    def block_writes(self, name: str) -> dict:
+        self.egresses[name].block_writes()
+        return self.egresses[name].snapshot()
+
+    def unblock_writes(self, name: str) -> dict:
+        self.egresses[name].unblock_writes()
         return self.egresses[name].snapshot()
 
     # -- introspection -------------------------------------------------------------

@@ -17,6 +17,8 @@ MAC1 = "00:00:00:00:00:11"
 MAC2 = "00:00:00:00:00:22"
 MAC3 = "00:00:00:00:00:33"
 MAC4 = "00:00:00:00:00:44"
+MAC5 = "00:00:00:00:00:55"
+MAC6 = "00:00:00:00:00:66"
 
 failures: list[str] = []
 
@@ -37,9 +39,13 @@ def wait_total(client: httpx.Client, name: str, total: int, timeout: float = 10.
     return client.get(f"/api/receivers/{name}/frames", params={"limit": 5000}).json()
 
 
-def pending(client: httpx.Client, name: str) -> int:
+def egress(client: httpx.Client, name: str) -> dict:
     data = client.get("/api/egresses").json()["egresses"]
-    return next(e["pending"] for e in data if e["name"] == name)
+    return next(e for e in data if e["name"] == name)
+
+
+def pending(client: httpx.Client, name: str) -> int:
+    return egress(client, name)["pending"]
 
 
 def binding_of(client: httpx.Client, mac: str) -> str | None:
@@ -119,6 +125,57 @@ def main() -> int:
         c.post("/api/egresses/A/resume")
         recv_a = wait_total(c, "A", 8 + caps["A"])
         check("A drained everything after resume", recv_a["total_received"] == 8 + caps["A"])
+
+        print("\n-- scenario 4: EAGAIN — frames count as sent only after a real write")
+        c.post("/api/receivers/reset")
+        c.post("/api/bindings", json={"vni": 100, "dst_mac": MAC5, "egress": "A"})
+        before = egress(c, "A")  # counters are cumulative: compare deltas
+        c.post("/api/egresses/A/block_writes")
+        c.post("/api/frames", json={"vni": 100, "dst_mac": MAC5, "count": 6})
+        time.sleep(1.0)  # A's socket keeps answering EAGAIN for a full second
+        state = egress(c, "A")
+        attempts = state["write_attempts"] - before["write_attempts"]
+        eagain = state["write_eagain"] - before["write_eagain"]
+        sent = state["sent"] - before["sent"]
+        check("writes attempted but capped (<=20/s)", 0 < attempts <= 20,
+              f"attempts={attempts}")
+        check("every attempt hit EAGAIN", eagain == attempts, f"eagain={eagain}")
+        check("nothing counted as sent", sent == 0, f"sent={sent}")
+        check("frames still occupy A's capacity", state["pending"] == 6)
+        recv_a = c.get("/api/receivers/A/frames").json()
+        check("receiver A got nothing", recv_a["total_received"] == 0)
+
+        print("\n-- scenario 5: rebind while the old egress is unwritable")
+        r = c.post("/api/bindings", json={"vni": 100, "dst_mac": MAC5, "egress": "B"})
+        body = r.json()
+        check("rebind accepted", r.status_code == 200, f"moved_pending={body.get('moved_pending')}")
+        check("all 6 unsent frames moved", body.get("moved_pending") == 6)
+        check("old egress drained", pending(c, "A") == 0)
+        recv_b = wait_total(c, "B", 6)
+        seqs = [f["seq"] for f in recv_b["frames"]]
+        check("B received all 6 in enqueue order", seqs == list(range(1, 7)), f"seqs={seqs}")
+        sent_before_unblock = egress(c, "A")["sent"]
+        c.post("/api/egresses/A/unblock_writes")
+        time.sleep(0.3)
+        recv_a = c.get("/api/receivers/A/frames").json()
+        check("recovered A never leaks the moved frames", recv_a["total_received"] == 0,
+              f"A total={recv_a['total_received']}")
+        check("A sent nothing after recovery", egress(c, "A")["sent"] == sent_before_unblock)
+
+        print("\n-- scenario 6: release resumes a backlogged egress within 100 ms")
+        c.post("/api/bindings", json={"vni": 100, "dst_mac": MAC6, "egress": "A"})
+        c.post("/api/egresses/A/block_writes")
+        c.post("/api/frames", json={"vni": 100, "dst_mac": MAC6, "count": 4})
+        time.sleep(0.2)
+        check("backlog held on blocked A", pending(c, "A") == 4)
+        t0 = time.monotonic()
+        c.post("/api/egresses/A/unblock_writes")
+        recv_a = wait_total(c, "A", 4, timeout=2.0)
+        elapsed = time.monotonic() - t0
+        check("resumed within 100 ms", recv_a["total_received"] == 4 and elapsed < 0.1,
+              f"{elapsed*1000:.0f} ms")
+        check("A delivered its 4 in order",
+              [f["seq"] for f in recv_a["frames"]] == [1, 2, 3, 4])
 
         print("\n== summary ==")
         if failures:

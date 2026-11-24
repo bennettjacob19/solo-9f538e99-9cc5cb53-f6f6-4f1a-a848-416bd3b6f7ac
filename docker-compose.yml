@@ -11,3 +11,6 @@ services:
       EGRESS_A_CAPACITY: "100"
       EGRESS_B_CAPACITY: "50"
       SEND_INTERVAL: "0.001"
+      # Backoff between write retries after EAGAIN: with 0.06 a continuously
+      # unwritable egress attempts < 20 writes/s and resumes < 100 ms after release.
+      WRITE_RETRY_INTERVAL: "0.06"
